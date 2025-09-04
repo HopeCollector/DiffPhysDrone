@@ -1,0 +1,9 @@
+.devcontainer
+.vscode
+__pycache__
+.venv
+*.egg-info
+dist
+quadsim_cuda/src/**/*.so
+runs/**
+log/**
