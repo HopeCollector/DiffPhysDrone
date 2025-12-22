@@ -142,12 +142,13 @@ for i in pbar:
         target_v_unit = target_v_raw / target_v_norm
         target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)
         state = [
-            torch.squeeze(target_v[:, None] @ R, 1),
-            env.R[:, 2],
-            env.margin[:, None]]
+            torch.squeeze(target_v[:, None] @ R, 1), # 1. 目标速度 (相对于机头方向)
+            env.R[:, 2],                             # 2. 重力方向 (感知自己的倾斜姿态)
+            env.margin[:, None]                      # 3. 自身半径 (我知道自己有多胖)
+        ]
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
-        if not args.no_odom:
-            state.insert(0, local_v)
+        if not args.no_odom:                         # 4. 如果有里程计...
+            state.insert(0, local_v)                 #    插入当前真实速度
         state = torch.cat(state, -1)
 
         # normalize
