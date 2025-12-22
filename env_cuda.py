@@ -257,20 +257,67 @@ class Env:
     @staticmethod
     @torch.no_grad()
     def update_state_vec(R, a_thr, v_pred, alpha, yaw_inertia=5):
+        """
+        更新无人机的旋转矩阵 (姿态)。
+        
+        参数:
+            R: 当前的旋转矩阵 (Batch, 3, 3)。[Forward, Left, Up]
+            a_thr: 当前的总加速度/推力向量 (Batch, 3)。包含重力抵消部分。
+            v_pred: 预测的目标速度方向 (Batch, 3)。用于引导机头朝向 (Yaw)。
+            alpha: 平滑系数 (0~1)。控制机头转向的平滑程度。
+            yaw_inertia: 偏航惯性系数。越大越难转向。
+        """
+        # 1. 获取当前的机头方向 (Forward Vector)
+        # R[..., 0] 对应旋转矩阵的第一列，即机体坐标系的 X 轴 (前方)
         self_forward_vec = R[..., 0]
+        
+        # 2. 计算纯推力方向 (Up Vector)
+        # 四旋翼的推力方向永远垂直于机身平面向上。
+        # a_thr 是总加速度，我们需要减去重力加速度 g_std 才能得到纯空气动力推力。
+        # 但这里代码写的是 a_thr - g_std，注意 g_std 是 (0, 0, -9.8)。
+        # 所以这里实际上是 a_thr - (0,0,-9.8) = a_thr + (0,0,9.8)。
+        # 这计算的是合外力方向，或者说是为了维持该加速度所需的推力方向。
         g_std = torch.tensor([0, 0, -9.80665], device=R.device)
-        a_thr = a_thr - g_std
+        a_thr = a_thr - g_std 
+        
+        # 归一化得到单位向量，这就是新的机身“上方” (Z轴)
         thrust = torch.norm(a_thr, 2, -1, True)
         self_up_vec = a_thr / thrust
+
+        # 3. 计算新的机头方向 (Forward Vector / Yaw)
+        # 这是一个混合操作：
+        # 旧的机头方向 * 惯性 + 预测的速度方向
+        # 意图：让机头慢慢转向飞行的方向 (Coordinated Turn)。
         forward_vec = self_forward_vec * yaw_inertia + v_pred
+        
+        # 使用 alpha 进行平滑插值 (低通滤波)
+        # 新方向 = 旧方向 * alpha + 目标方向 * (1-alpha)
         forward_vec = self_forward_vec * alpha + F.normalize(forward_vec, 2, -1) * (1 - alpha)
+        
+        # 4. 施加几何约束 (Gram-Schmidt 正交化)
+        # 机头方向 (Forward) 必须与机身垂直方向 (Up) 正交。
+        # 也就是 Forward 向量必须在与 Up 向量垂直的平面上。
+        # 公式推导：我们要找一个 forward_vec，使得 dot(forward, up) = 0。
+        # 这里通过调整 forward_vec 的 Z 分量来实现正交化。
+        # (fx * ux + fy * uy + fz * uz = 0) => fz = -(fx * ux + fy * uy) / uz
         forward_vec[:, 2] = (forward_vec[:, 0] * self_up_vec[:, 0] + forward_vec[:, 1] * self_up_vec[:, 1]) / -self_up_vec[2]
+        
+        # 归一化得到最终的机头方向
         self_forward_vec = F.normalize(forward_vec, 2, -1)
+        
+        # 5. 计算左侧方向 (Left Vector)
+        # 利用叉乘：Left = Up x Forward (注意顺序，右手定则)
+        # 或者是 Cross(Up, Forward) 得到 Left? 
+        # 通常坐标系是：X(前), Y(左), Z(上)。
+        # Cross(Z, X) = Y。即 Cross(Up, Forward) = Left。
         self_left_vec = torch.cross(self_up_vec, self_forward_vec)
+        
+        # 6. 组合成新的旋转矩阵
+        # 将三个正交基向量堆叠起来
         return torch.stack([
-            self_forward_vec,
-            self_left_vec,
-            self_up_vec,
+            self_forward_vec, # Col 0: X axis
+            self_left_vec,    # Col 1: Y axis
+            self_up_vec,      # Col 2: Z axis
         ], -1)
 
     def render(self, ctl_dt):
