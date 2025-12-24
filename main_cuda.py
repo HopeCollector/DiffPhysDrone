@@ -77,6 +77,34 @@ def smooth_dict(ori_dict):
         scaler_q[k].append(float(v))
 
 def barrier(x: torch.Tensor, v_to_pt):
+    """
+    计算障碍函数(Barrier Function)的损失值。
+
+    该函数实现了一个基于ReLU的二次障碍函数,用于约束优化问题中。
+    当输入值x小于1时会产生惩罚,确保优化过程中满足特定约束条件。
+
+    Args:
+        x (torch.Tensor): 输入张量,通常表示需要约束的变量值。
+                          期望值应该大于等于1,小于1的部分会被惩罚。
+        v_to_pt: 权重系数,用于调节障碍函数的强度。可以是标量或张量,
+                 用于控制不同约束的重要程度。
+
+    Returns:
+        torch.Tensor: 标量张量,表示障碍函数的平均损失值。
+                      计算公式: mean(v_to_pt * relu(1-x)^2)
+
+    工作原理:
+        1. 计算 (1 - x):得到与目标值1的偏差
+        2. 应用 relu():只保留负偏差(即x < 1的情况),将x >= 1的部分置零
+        3. 求平方 pow(2):对违反约束的程度进行二次惩罚
+        4. 乘以权重 v_to_pt:应用自定义的惩罚强度
+        5. 求均值 mean():返回所有元素的平均障碍损失
+
+    注意:
+        - 当x >= 1时,relu(1-x) = 0,不产生任何惩罚
+        - 当x < 1时,惩罚值随着偏差增大而二次增长
+        - 这种形式常用于interior point方法和约束优化算法中
+    """
     return (v_to_pt * (1 - x).relu().pow(2)).mean()
 
 def is_save_iter(i):
@@ -116,50 +144,84 @@ for i in pbar:
 
 
     for t in range(args.timesteps):
+        # 采样控制时间步长，模拟控制时间步长的随机性 10% 的标准差
         ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+        # 运行环境一步，得到深度图。depth: (B, 12, 16)；flow：None
         depth, flow = env.render(ctl_dt)
+        # 收集无人机当前位置
         p_history.append(env.p)
+        # 收集无人机到最近障碍物的向量
         vec_to_pt_history.append(env.find_vec_to_nearest_pt())
 
+        # 如果是保存迭代（比如每 1000 次），就把第 4 个无人机的深度图存下来，稍后生成视频或图片
         if is_save_iter(i):
             vid.append(depth[4])
 
         if args.yaw_drift:
+            # 模拟航向漂移
             target_v_raw = torch.squeeze(target_v_raw[:, None] @ R_drift, 1)
         else:
+            # 直接使用目标位置减去当前位置，得到目标速度（未归一化）
+            # .detach()：不计算梯度，防止梯度回传到环境模拟器
             target_v_raw = env.p_target - env.p.detach()
+        # 仿真环境运行一步，使用上一次的动作
         env.run(act_buffer[t], ctl_dt, target_v_raw)
 
+        # 无人机姿态（body -> world）
         R = env.R
+        # 当前航向
         fwd = env.R[:, :, 0].clone()
         up = torch.zeros_like(fwd)
+        # 把航向的 z 分量设为 0，得到水平投影
         fwd[:, 2] = 0
+        # 上方向锁定为世界坐标系的 z 方向
         up[:, 2] = 1
+        # 归一化航向向量
         fwd = F.normalize(fwd, 2, -1)
+        # 重新计算正交基
+        # 新的姿态矩阵仅航向与机体坐标系一致，但不考虑俯仰与横滚
         R = torch.stack([fwd, torch.cross(up, fwd), up], -1)
+        # BUG：这样做会导致在俯仰角较大时，航向无法正确反映无人机实际前进方向，训练不出来能翻滚的策略
 
+        # 限制目标速度
         target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
         target_v_unit = target_v_raw / target_v_norm
         target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)
+
+        # 构造观测状态 state
         state = [
             torch.squeeze(target_v[:, None] @ R, 1), # 1. 目标速度 (相对于机头方向)
             env.R[:, 2],                             # 2. 重力方向 (感知自己的倾斜姿态)
             env.margin[:, None]                      # 3. 自身半径 (我知道自己有多胖)
         ]
+
+        # 计算当前速度相对于机头方向的表示
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom:                         # 4. 如果有里程计...
             state.insert(0, local_v)                 #    插入当前真实速度
+        # 把所有状态量拼接在一起，得到最终的状态表示
         state = torch.cat(state, -1)
 
         # normalize
+        # 计算视差图
         x = 3 / depth.clamp_(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02
         x = F.max_pool2d(x[:, None], 4, 4)
+
+        # 神经网络前向传播
         act, values, h = model(x, state, h)
 
+        # 把动作从本地坐标系转换到全局坐标系（俯仰与横滚不动）
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
         v_preds.append(v_pred)
+        # 这里是在从期望加速度反推要给出多少加速度，直接看公式比较难受，反过来想：
+        # 实际推力 = 期望推力 * 动力系统误差 + 与速度成正比的阻力 + 重力
+        # 那么我们为了实现期望推力，需要给出多少实际推力就是
+        # 给出推力 = (期望推力 - 重力 - 阻力) * 动力系统系数
+        # 最后那个重力补偿来自 env.run，它会先做一次重力补偿
         act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         act_buffer.append(act)
+        
+        # 没用上
         v_net_feats.append(torch.cat([act, local_v, h], -1))
 
         v_history.append(env.v)
@@ -170,22 +232,31 @@ for i in pbar:
     act_buffer = torch.stack(act_buffer)
 
     v_history = torch.stack(v_history)
+    # 返回一个同样形状的张量，其中第 i 行是前 i 行所有速度的总和
     v_history_cum = v_history.cumsum(0)
     v_history_avg = (v_history_cum[30:] - v_history_cum[:-30]) / 30
     target_v_history = torch.stack(target_v_history)
     T, B, _ = v_history.shape
+    # 计算速度误差的 loss
     delta_v = torch.norm(v_history_avg - target_v_history[1:1-30], 2, -1)
     loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
 
+    # 速度预测的 loss
     v_preds = torch.stack(v_preds)
     loss_v_pred = F.mse_loss(v_preds, v_history.detach())
 
+    # 实际速度与目标速度的对齐 loss
     target_v_history_norm = torch.norm(target_v_history, 2, -1)
     target_v_history_normalized = target_v_history / target_v_history_norm[..., None]
+    # 实际速度方向在目标速度方向上的投影长度
     fwd_v = torch.sum(v_history * target_v_history_normalized, -1)
     loss_bias = F.mse_loss(v_history, fwd_v[..., None] * target_v_history_normalized) * 3
 
+    # 加加速度（急动度）
     jerk_history = act_buffer.diff(1, 0).mul(15)
+    # 去掉重力干扰的纯加加加速度（跳动度）
+    # TODO：虽然本意是计算姿态时不要出现除数为零的问题，但推力归零时仍然会出问题
+    # 建议敢用加权平滑，当推力较小时，代价直接归零
     snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)
     loss_d_acc = act_buffer.pow(2).sum(-1).mean()
     loss_d_jerk = jerk_history.pow(2).sum(-1).mean()
@@ -195,11 +266,18 @@ for i in pbar:
     distance = torch.norm(vec_to_pt_history, 2, -1)
     distance = distance - env.margin
     with torch.no_grad():
+        # torch.diff(arr, n, dim)：计算张量 arr 在指定维度 dim 上的 n 阶离散差分
+        # 计算的是接近障碍物的速度，所以前面有个负号表示接近障碍物时速度为正
+        # ？？？ 135 是一个意义不明的超参数
+        # BUG：diff 的计算维度应该是 0，因为 distance 的形状是 (T, B)
         v_to_pt = (-torch.diff(distance, 1, 1) * 135).clamp_min(1)
+    # 当与障碍物距离小于 1m(在 barrier 函数中硬编码) 时，产生二次惩罚
     loss_obj_avoidance = barrier(distance[:, 1:], v_to_pt)
+    # 发生碰撞时会产生极大的惩罚
     loss_collide = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()
 
     speed_history = v_history.norm(2, -1)
+    # 速度方向 loss
     loss_speed = F.smooth_l1_loss(fwd_v, target_v_history_norm)
 
     loss = args.coef_v * loss_v + \
