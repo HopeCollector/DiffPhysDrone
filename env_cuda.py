@@ -335,6 +335,35 @@ class Env:
         return canvas, None
 
     def find_vec_to_nearest_pt(self):
+        """
+        计算从无人机未来位置到最近障碍物表面点的向量。
+        
+        该方法用于计算无人机在下一个子步长位置处，到周围最近障碍物表面的向量。
+        这个向量可用于碰撞检测、避障规划和安全距离计算。
+        
+        计算流程：
+        1. 根据当前位置(p)和速度(v)，预测下一个子步长后的位置
+        2. 调用CUDA内核查找该位置到所有障碍物的最近点
+        3. 返回从预测位置指向最近障碍物点的向量
+        
+        障碍物类型包括：
+        - balls: 球形障碍物（如无人机之间的碰撞检测）
+        - cyl: 垂直圆柱体障碍物
+        - cyl_h: 水平圆柱体障碍物
+        - voxels: 长方体障碍物（如建筑物、地面、天花板）
+        
+        Returns:
+            torch.Tensor: 形状为(B, 3)的张量，表示从无人机预测位置到最近障碍物点的向量
+                         - 向量长度表示到障碍物的距离
+                         - 向量方向指向障碍物
+                         - 当无人机接近障碍物时，向量长度变小
+        
+        Note:
+            - 该方法在训练中用于计算碰撞损失和避障损失
+            - 使用CUDA加速计算，支持批量并行处理
+            - 考虑了无人机半径(drone_radius)以确保安全间距
+            - n_drones_per_group参数用于多机协同时的碰撞检测分组
+        """
         p = self.p + self.v * self.sub_div
         nearest_pt = torch.empty_like(p)
         quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
