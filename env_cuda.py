@@ -44,56 +44,105 @@ class Env:
     def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
                  single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
                  random_rotation=False, cam_angle=10) -> None:
+        """
+        初始化四旋翼飞行模拟环境。
+        
+        参数:
+            batch_size: 批次大小，同时模拟的无人机数量
+            width: 渲染图像宽度（像素）
+            height: 渲染图像高度（像素）
+            grad_decay: 梯度衰减系数，用于反向传播时的梯度缩放
+            device: 计算设备（'cpu' 或 'cuda'）
+            fov_x_half_tan: 相机水平视场角的一半的正切值，默认约30度
+            single: 是否为单机模式（不考虑多机编队）
+            gate: 是否生成门框障碍物
+            ground_voxels: 是否生成地面平面障碍物
+            scaffold: 是否生成脚手架结构障碍物
+            speed_mtp: 速度倍数，用于调整最大速度
+            random_rotation: 是否随机旋转整个场景
+            cam_angle: 相机俯仰角（度），用于调整机载相机视角
+        """
         self.device = device
         self.batch_size = batch_size
         self.width = width
         self.height = height
         self.grad_decay = grad_decay
+        
+        # 环境障碍物参数：_w(Weight)为随机生成时的缩放范围，_b(Bias)为位置偏置
+        # 球形障碍物：[x范围, y范围, z范围, 半径范围]
         self.ball_w = torch.tensor([8., 18, 6, 0.2], device=device)
         self.ball_b = torch.tensor([0., -9, -1, 0.4], device=device)
+        
+        # 长方体障碍物：[x, y, z, x尺寸, y尺寸, z尺寸]
         self.voxel_w = torch.tensor([8., 18, 6, 0.1, 0.1, 0.1], device=device)
         self.voxel_b = torch.tensor([0., -9, -1, 0.2, 0.2, 0.2], device=device)
+        
+        # 地面长方体障碍物：用于生成地面平面和起伏
         self.ground_voxel_w = torch.tensor([8., 18,  0, 2.9, 2.9, 1.9], device=device)
         self.ground_voxel_b = torch.tensor([0., -9, -1, 0.1, 0.1, 0.1], device=device)
+        
+        # 垂直圆柱体障碍物：[x, y, 半径]
         self.cyl_w = torch.tensor([8., 18, 0.35], device=device)
         self.cyl_b = torch.tensor([0., -9, 0.05], device=device)
+        
+        # 水平圆柱体障碍物：用于脚手架等结构
         self.cyl_h_w = torch.tensor([8., 6, 0.1], device=device)
         self.cyl_h_b = torch.tensor([0., 0, 0.05], device=device)
+        
+        # 门框参数：[x位置, y位置, z位置, 半径]
         self.gate_w = torch.tensor([2.,  2,  1.0, 0.5], device=device)
         self.gate_b = torch.tensor([3., -1,  0.0, 0.5], device=device)
+        
+        # 风速扰动范围：[x方向, y方向, z方向]
         self.v_wind_w = torch.tensor([1,  1,  0.2], device=device)
+        
+        # 标准重力加速度向量（m/s²）
         self.g_std = torch.tensor([0., 0, -9.80665], device=device)
+        
+        # 屋顶障碍物附加参数：用于生成天花板和屋顶结构
         self.roof_add = torch.tensor([0., 0., 2.5, 1.5, 1.5, 1.5], device=device)
+        
+        # 子步长时间分割：将一个控制周期(1/15秒)分成10个子步进行物理仿真
         self.sub_div = torch.linspace(0, 1. / 15, 10, device=device).reshape(-1, 1, 1)
+        
+        # 无人机初始位置（米）：8个预设起点，支持多机编队
         self.p_init = torch.as_tensor([
-            [-1.5, -3.,  1],
-            [ 9.5, -3.,  1],
-            [-0.5,  1.,  1],
-            [ 8.5,  1.,  1],
-            [ 0.0,  3.,  1],
-            [ 8.0,  3.,  1],
-            [-1.0, -1.,  1],
-            [ 9.0, -1.,  1],
+            [-1.5, -3.,  1],  # 左下
+            [ 9.5, -3.,  1],  # 右下
+            [-0.5,  1.,  1],  # 左中
+            [ 8.5,  1.,  1],  # 右中
+            [ 0.0,  3.,  1],  # 左上
+            [ 8.0,  3.,  1],  # 右上
+            [-1.0, -1.,  1],  # 左中下
+            [ 9.0, -1.,  1],  # 右中下
         ], device=device).repeat(batch_size // 8 + 7, 1)[:batch_size]
+        
+        # 无人机目标位置（米）：与初始位置对应的终点
         self.p_end = torch.as_tensor([
-            [8.,  3.,  1],
-            [0.,  3.,  1],
-            [8., -1.,  1],
-            [0., -1.,  1],
-            [8., -3.,  1],
-            [0., -3.,  1],
-            [8.,  1.,  1],
-            [0.,  1.,  1],
+            [8.,  3.,  1],   # 目标：右上
+            [0.,  3.,  1],   # 目标：左上
+            [8., -1.,  1],   # 目标：右中下
+            [0., -1.,  1],   # 目标：左中下
+            [8., -3.,  1],   # 目标：右下
+            [0., -3.,  1],   # 目标：左下
+            [8.,  1.,  1],   # 目标：右中
+            [0.,  1.,  1],   # 目标：左中
         ], device=device).repeat(batch_size // 8 + 7, 1)[:batch_size]
+        
+        # 光流缓冲区：用于渲染运动光流（当前为空）
         self.flow = torch.empty((batch_size, 0, height, width), device=device)
-        self.single = single
-        self.gate = gate
-        self.ground_voxels = ground_voxels
-        self.scaffold = scaffold
-        self.speed_mtp = speed_mtp
-        self.random_rotation = random_rotation
-        self.cam_angle = cam_angle
-        self.fov_x_half_tan = fov_x_half_tan
+        
+        # 环境配置标志
+        self.single = single                    # 单机模式标志
+        self.gate = gate                        # 是否启用门框
+        self.ground_voxels = ground_voxels      # 是否启用地面障碍物
+        self.scaffold = scaffold                # 是否启用脚手架
+        self.speed_mtp = speed_mtp              # 速度倍增系数
+        self.random_rotation = random_rotation  # 是否随机旋转场景
+        self.cam_angle = cam_angle              # 相机俯仰角
+        self.fov_x_half_tan = fov_x_half_tan    # 相机视场角参数
+        
+        # 初始化环境状态
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
