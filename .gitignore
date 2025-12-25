@@ -8,3 +8,4 @@ quadsim_cuda/src/**/*.so
 runs/**
 log/**
 checkpoint*.pth
+share/
