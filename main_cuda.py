@@ -9,6 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from aim import Run
 
 import argparse
 from model import Model
@@ -43,6 +44,8 @@ parser.add_argument('--yaw_drift', default=False, action='store_true')
 parser.add_argument('--no_odom', default=False, action='store_true')
 args = parser.parse_args()
 writer = SummaryWriter()
+aim_run = Run(repo='share/aim_data')
+aim_run['hparams'] = vars(args)
 print(args)
 
 device = torch.device('cuda')
@@ -351,5 +354,9 @@ for i in pbar:
             torch.save(model.state_dict(), f'checkpoint{i//10000:04d}.pth')
         if (i + 1) % 25 == 0:
             for k, v in scaler_q.items():
-                writer.add_scalar(k, sum(v) / len(v), i + 1)
+                avg_val = sum(v) / len(v)
+                writer.add_scalar(k, avg_val, i + 1)
+                aim_run.track(avg_val, name=k, step=i + 1)
             scaler_q.clear()
+
+aim_run.close()
