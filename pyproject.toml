@@ -3,14 +3,31 @@ name = "diffphy"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "aim>=3.29.1",
     "dotenv>=0.9.9",
     "matplotlib>=3.10.6",
     "numpy>=2.3.2",
+    "opencv-python>=4.13.0.92",
+    "scipy>=1.17.1",
     "tensorboard>=2.20.0",
     "torch>=2.8.0",
     "tqdm>=4.67.1",
+    "transforms3d>=0.4.2",
 ]
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "preflight: 仿真环境预飞检测（需要 Gazebo 仿真运行中）",
+    "flight: 飞行管线功能测试（需要 Gazebo 仿真运行中，会实际飞行）",
+]
+addopts = "-v --tb=short -W default::UserWarning"
