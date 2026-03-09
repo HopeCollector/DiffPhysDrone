@@ -1,82 +1,115 @@
-# Vision-based Agile Flight Training Code
+# BitPilot — Vision-based Agile Flight
 
 ## 概览
 
-本仓库包含 **Learning Vision-based Agile Flight via Differentiable Physics** 的训练代码。
+本仓库包含基于可微物理（Differentiable Physics）的视觉敏捷飞行训练与部署框架，服务于 skybit 无人机集群项目的单机安全控制核心。
 
-**更新说明**：
-本项目已针对 **NVIDIA RTX 5090** 显卡进行了适配与测试。同时，项目依赖管理已迁移至 `uv`，并调整了部分文件结构。
+## 快速开始
 
-## 环境配置
+### 前置条件
 
-### Python 环境
+| 依赖 | 最低版本 | 说明 |
+|------|---------|------|
+| NVIDIA Driver | 580+ | 需支持 CUDA 12.x |
+| CUDA Toolkit | 12.x | 容器内已预装 nvcc 12.9 |
+| Python | 3.12+ | |
+| uv | 0.9+ | Python 包管理器 |
 
-本项目使用 `uv` 进行高效的包管理和环境配置。请确保您的系统中已安装 `uv`。
+### 一键安装
 
-1. 安装 `uv` (如果尚未安装):
-   ```bash
-   pip install uv
-   ```
-
-2. 同步项目依赖并创建虚拟环境:
-   ```bash
-   uv sync
-   ```
-
-3. 激活虚拟环境:
-   ```bash
-   source .venv/bin/activate
-   ```
-
-### 编译 CUDA 算子
-
-由于项目结构调整，CUDA 算子的安装目标已变更为 `quadsim_cuda` 目录。请在激活的虚拟环境中运行以下命令进行编译和安装：
+`uv sync` 会自动完成所有工作：安装 Python 依赖、编译 CUDA 扩展 `quadsim-cuda`、注册 CLI 入口点。
 
 ```bash
-uv pip install -e quadsim_cuda
+uv sync
+```
+
+> **关于 CUDA 扩展编译**：四旋翼动力学 CUDA 内核 (`src/bitpilot/_csrc/`) 会被编译为 `bitpilot._C` 模块。编译时必须链接 venv 内的 PyTorch（保证运行时 ABI 一致），项目已在 `pyproject.toml` 中配置了 `no-build-isolation-package`，`uv sync` 会自动处理，**无需手动传递额外参数**。
+
+首次编译约需 2 分钟（CUDA kernel 编译）。后续 `uv sync` 如果源码未变更则会跳过重建。
+
+### 验证安装
+
+```bash
+uv run pytest tests/ -v
 ```
 
 ## 训练
 
-训练流程与原版保持一致。使用以下命令启动训练：
-
 ```bash
-# 多智能体训练 (Multi-agent)
-python main_cuda.py $(cat configs/multi_agent.args)
+# 单智能体训练（含障碍物避障）
+uv run bitpilot-train $(cat configs/single_agent.args)
 
-# 单智能体训练 (Single-agent)
-python main_cuda.py $(cat configs/single_agent.args)
+# 多智能体训练（含门通过）
+uv run bitpilot-train $(cat configs/multi_agent.args)
 ```
 
-## 评估
+常用训练参数可在 `configs/*.args` 中配置。运行 `uv run bitpilot-train --help` 查看全部参数。
 
-若要在多智能体设置中评估训练好的模型，请按以下步骤操作：
+训练日志写入 `runs/` 目录，可用 TensorBoard 查看：
 
-1. 启动模拟器 (需使用配套的模拟器程序):
-   ```bash
-   cd <path to multi agent code supplementary>
-   ./LinuxNoEditor/Blocks.sh -ResX=896 -ResY=504 -windowed -WinX=512 -WinY=304 -settings=$PWD/settings.json
-   ```
+```bash
+uv run tensorboard --logdir runs/
+```
 
-2. 运行评估脚本:
-   ```bash
-   python eval.py --resume <path to checkpoint> --target_speed 2.5
-   ```
+### 从检查点恢复训练
+
+```bash
+uv run bitpilot-train $(cat configs/single_agent.args) --resume checkpoints/checkpoint0004.pth
+```
+
+## 部署（ROS2 推理节点）
+
+推理节点将训练好的模型接入 Gazebo 仿真环境，通过 ROS2 话题实时控制无人机。
+
+### 启动推理
+
+```bash
+# 需要先 source ROS2 环境
+source /opt/ros/jazzy/setup.bash
+
+# 启动推理节点，飞向目标点 (10, 0, 1.5)
+uv run bitpilot-infer --target 10 0 1.5
+```
+
+主要参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--target` | 必填 | 目标位置 x y z（世界系 FLU） |
+| `--checkpoint` | `checkpoints/checkpoint0004.pth` | 模型权重路径 |
+| `--max_speed` | 2.0 | 最大飞行速度 (m/s) |
+| `--margin` | 0.15 | 碰撞安全半径 (m) |
+| `--yaw_rate_gain` | 1.5 | 航向跟随 P 控制器增益 |
+| `--device` | `cuda` | 推理设备 |
+
+### 仿真环境预飞检测
+
+确认 Gazebo 仿真正常运行后，运行预飞检测脚本验证所有传感器和话题：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 check_sim.py [--timeout 5]
+```
 
 ## 项目结构
 
 ```plaintext
 .
-├── configs/            # 训练配置文件 (.args)
-├── quadsim_cuda/       # 四旋翼动力学仿真 CUDA 算子包 (需编译安装)
-├── runs/               # 训练运行日志 (TensorBoard) 和模型检查点
-├── src/                # 原始源码目录 (部分功能已迁移至 quadsim_cuda)
-├── check_sim.py        # 仿真环境预飞检测脚本
-├── env_cuda.py         # 仿真环境 Python 封装
-├── main_cuda.py        # 训练主程序入口
-├── model.py            # 神经网络模型定义
-├── pyproject.toml      # 项目依赖与配置 (uv)
-└── README.md           # 项目说明文档
+├── src/bitpilot/          # Python 主包
+│   ├── _csrc/             # CUDA C++ 扩展源码 → 编译为 bitpilot._C
+│   ├── model.py           # 神经网络模型定义 (CNN+GRU)
+│   ├── env.py             # 可微物理仿真环境
+│   ├── train.py           # 训练主程序入口
+│   └── deploy/
+│       └── inference_node.py  # ROS2 推理节点
+├── configs/               # 训练配置文件 (.args)
+├── scripts/               # 启动脚本
+├── tests/                 # 测试套件 (pytest)
+├── checkpoints/           # 模型检查点 (.pth)
+├── share/gz/              # Gazebo 仿真配置
+├── pyproject.toml         # 项目依赖与配置 (uv)
+├── setup.py               # CUDA 扩展编译配置
+└── README.md
 ```
 
 ---
@@ -87,7 +120,7 @@ python main_cuda.py $(cat configs/single_agent.args)
 
 ### 一、模型概述
 
-模型定义在 `model.py` 中，类名 `Model`。它是一个 **视觉-状态融合的循环神经网络**，流程为：
+模型定义在 `src/bitpilot/model.py` 中，类名 `Model`。它是一个 **视觉-状态融合的循环神经网络**，流程为：
 
 ```
 深度图 ──→ CNN(stem) ──→ 图像特征(192维)
@@ -99,10 +132,10 @@ python main_cuda.py $(cat configs/single_agent.args)
 
 ### 二、模型实例化
 
-训练使用的实例化方式（见 `main_cuda.py`）：
+训练使用的实例化方式（见 `src/bitpilot/train.py`）：
 
 ```python
-from model import Model
+from bitpilot.model import Model
 
 # 有里程计模式（推荐，部署时通常有 odom）
 model = Model(dim_obs=10, dim_action=6)
@@ -114,7 +147,7 @@ model = Model(dim_obs=10, dim_action=6)
 加载 checkpoint：
 
 ```python
-state_dict = torch.load('checkpoint0004.pth', map_location=device)
+state_dict = torch.load('checkpoints/checkpoint0004.pth', map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
 ```
@@ -319,12 +352,12 @@ thrust_cmd = (a_pred - v_pred - g) * thr_est_error + g
 ```python
 import torch
 import torch.nn.functional as F
-from model import Model
+from bitpilot.model import Model
 
-# ── 初始化 ────────────────────────────────────────
+# ── 初始化 ────────────────────────────────────────────────
 device = torch.device('cuda')
 model = Model(dim_obs=10, dim_action=6).to(device)
-model.load_state_dict(torch.load('checkpoint0004.pth', map_location=device))
+model.load_state_dict(torch.load('checkpoints/checkpoint0004.pth', map_location=device))
 model.eval()
 
 hx = None                               # GRU 隐状态
@@ -585,7 +618,7 @@ body_up = R_body[:, 2]       # 旋转矩阵第 3 列
 │     target_position: [x, y, z]     ←── 目标位置           │
 │     max_speed: 2.0                                       │
 │     margin: 0.15                                         │
-│     checkpoint: checkpoint0004.pth                       │
+│     checkpoint: checkpoints/checkpoint0004.pth           │
 └──────────────────────────────────────────────────────────┘
 ```
 

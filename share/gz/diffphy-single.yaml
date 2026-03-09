@@ -1,0 +1,31 @@
+# 单机仿真配置
+#
+# Usage:
+#   uv run scripts/sim.py single          # 自动构建 + 启动
+#   uv run scripts/sim.py single -n       # 跳过构建（开发迭代）
+
+# ---------- Simulation Parameters ----------
+# headless: true            # 无 GUI, 仅物理服务器 (默认 false)
+obstacles: "30"           # 数字 → config/obstacles/30.0.json
+                            # 绝对路径 → 直接使用
+                            # "generate" → 运行时生成
+                            # 留空/省略 → 空世界
+# gz_args: ""               # 额外 gz sim 参数
+# map_offset_x: ""          # 地图 X 偏移 (默认 10m)
+# map_offset_y: ""          # 地图 Y 偏移 (默认 -map_width/2)
+
+# ---------- Global Defaults ----------
+# 所有 UAV 共享，可被 per-UAV 覆盖。
+# 支持 uav.sdf.jinja 中的所有模板变量 (lidar_*, rgbd_camera_*, imu_*)。
+defaults:
+  enable_imu: true
+  enable_rgbd_camera: true
+  enable_lidar: false
+  enable_contact: true
+
+# ---------- UAV Definitions ----------
+uavs:
+  - name: uav1
+    pose: [0.0, 0.0, 0.2, 0, 0, 0]
+    rgbd_camera_hfov: 1.365 # 匹配 diffphy
+    rgbd_camera_clip_far: 25.0 # 匹配 diffphy
