@@ -20,10 +20,10 @@ if [ -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
 fi
 
 echo "──────────────────────────────────────"
-echo "  DiffPhy Inference Node"
+echo "  BitPilot Inference Node"
 echo "  Python: $(python3 --version 2>&1)"
 echo "  Device: $(python3 -c 'import torch; print("CUDA" if torch.cuda.is_available() else "CPU")')"
 echo "──────────────────────────────────────"
 
 # 运行推理节点，透传所有命令行参数
-exec python3 "$SCRIPT_DIR/inference_node.py" "$@"
+exec python3 -m bitpilot.deploy.inference_node "$@"

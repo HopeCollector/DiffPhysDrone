@@ -12,13 +12,18 @@ import time
 from dataclasses import dataclass
 
 import pytest
-import rclpy
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
-from sensor_msgs.msg import Image, CameraInfo, Imu
-from nav_msgs.msg import Odometry
+try:
+    import rclpy
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+    from sensor_msgs.msg import Image, CameraInfo, Imu
+    from nav_msgs.msg import Odometry
+
+    HAS_RCLPY = True
+except ImportError:
+    HAS_RCLPY = False
 
 
 # ═══════════════════════════════════════════════════════════
@@ -72,7 +77,7 @@ class TrainingConfig:
     # 部署默认值
     margin: float = 0.15
     max_speed: float = 2.0
-    checkpoint: str = "/ws/checkpoint0004.pth"
+    checkpoint: str = "checkpoints/checkpoint0004.pth"
 
 
 TRAIN_CFG = TrainingConfig()
@@ -98,47 +103,48 @@ class TopicStats:
         return (self.count - 1) / self.elapsed if self.elapsed > 0 else 0.0
 
 
-class CollectorNode(Node):
-    """订阅所有传感器话题，采集统计数据。不调用 rclpy.shutdown()。"""
+if HAS_RCLPY:
+    class CollectorNode(Node):
+        """订阅所有传感器话题，采集统计数据。不调用 rclpy.shutdown()。"""
 
-    def __init__(self, timeout: float):
-        super().__init__("preflight_checker")
-        self.timeout = timeout
-        self.stats: dict[str, TopicStats] = {}
-        self.done = False
+        def __init__(self, timeout: float):
+            super().__init__("preflight_checker")
+            self.timeout = timeout
+            self.stats: dict[str, TopicStats] = {}
+            self.done = False
 
-        qos_reliable = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
+            qos_reliable = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            )
 
-        self._subs = [
-            self.create_subscription(
-                Image, TOPICS["depth"], lambda m: self._cb("depth", m), qos_reliable),
-            self.create_subscription(
-                CameraInfo, TOPICS["caminfo"], lambda m: self._cb("caminfo", m), qos_reliable),
-            self.create_subscription(
-                Odometry, TOPICS["odom"], lambda m: self._cb("odom", m), qos_reliable),
-            self.create_subscription(
-                Imu, TOPICS["imu"], lambda m: self._cb("imu", m), qos_reliable),
-        ]
+            self._subs = [
+                self.create_subscription(
+                    Image, TOPICS["depth"], lambda m: self._cb("depth", m), qos_reliable),
+                self.create_subscription(
+                    CameraInfo, TOPICS["caminfo"], lambda m: self._cb("caminfo", m), qos_reliable),
+                self.create_subscription(
+                    Odometry, TOPICS["odom"], lambda m: self._cb("odom", m), qos_reliable),
+                self.create_subscription(
+                    Imu, TOPICS["imu"], lambda m: self._cb("imu", m), qos_reliable),
+            ]
 
-        self.start_time = time.monotonic()
-        self.timer = self.create_timer(0.1, self._tick)
+            self.start_time = time.monotonic()
+            self.timer = self.create_timer(0.1, self._tick)
 
-    def _cb(self, name: str, msg):
-        now = time.monotonic()
-        if name not in self.stats:
-            self.stats[name] = TopicStats(first_time=now)
-        s = self.stats[name]
-        s.count += 1
-        s.last_time = now
-        s.last_msg = msg
+        def _cb(self, name: str, msg):
+            now = time.monotonic()
+            if name not in self.stats:
+                self.stats[name] = TopicStats(first_time=now)
+            s = self.stats[name]
+            s.count += 1
+            s.last_time = now
+            s.last_msg = msg
 
-    def _tick(self):
-        if time.monotonic() - self.start_time > self.timeout:
-            self.done = True
+        def _tick(self):
+            if time.monotonic() - self.start_time > self.timeout:
+                self.done = True
 
 
 # ═══════════════════════════════════════════════════════════
@@ -167,6 +173,8 @@ def pytest_addoption(parser):
 @pytest.fixture(scope="session")
 def rclpy_context():
     """会话级 rclpy 生命周期管理"""
+    if not HAS_RCLPY:
+        pytest.skip("rclpy not available")
     rclpy.init()
     yield
     rclpy.shutdown()
@@ -179,6 +187,8 @@ def sim_data(rclpy_context, request):
 
     返回 dict[str, TopicStats]，各 test_preflight 测试用例共享。
     """
+    if not HAS_RCLPY:
+        pytest.skip("rclpy not available")
     timeout = request.config.getoption("--sim-timeout")
 
     print(f"\n[fixture:sim_data] 正在采集仿真数据 ({timeout}s)...")

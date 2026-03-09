@@ -3,7 +3,7 @@ import random
 import time
 import torch
 import torch.nn.functional as F
-import quadsim_cuda
+import bitpilot._C as quadsim_cuda
 
 
 class GDecay(torch.autograd.Function):
@@ -19,25 +19,37 @@ class GDecay(torch.autograd.Function):
 g_decay = GDecay.apply
 
 
-class RunFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, grad_decay, ctl_dt, airmode):
-        act_next, p_next, v_next, a_next = quadsim_cuda.run_forward(
-            R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, ctl_dt, airmode)
-        ctx.save_for_backward(R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next)
-        ctx.grad_decay = grad_decay
-        ctx.ctl_dt = ctl_dt
-        return act_next, p_next, v_next, a_next
+def run_forward(R, dg, z_drag_coef, drag_2, pitch_ctl_delay,
+                act_pred, act, p, v, v_wind, a, grad_decay, ctl_dt):
+    """纯 PyTorch 动力学前向传播，autograd 自动处理反向传播。"""
+    alpha = torch.exp(-pitch_ctl_delay * ctl_dt)
+    act_next = act_pred * (1 - alpha) + act * alpha
 
-    @staticmethod
-    def backward(ctx, d_act_next, d_p_next, d_v_next, d_a_next):
-        R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next = ctx.saved_tensors
-        d_act_pred, d_act, d_p, d_v, d_a = quadsim_cuda.run_backward(
-            R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next, d_act_next, d_p_next, d_v_next, d_a_next,
-            ctx.grad_decay, ctx.ctl_dt)
-        return None, None, None, None, None, d_act_pred, d_act, d_p, d_v, None, d_a, None, None, None
+    # 体轴速度分量
+    v_fwd_s, v_left_s, v_up_s = ((v - v_wind)[:, None] @ R).unbind(-1)
 
-run = RunFunction.apply
+    # 二次 + 一次阻力
+    drag = drag_2[:, :1] * (
+        v_fwd_s.abs() * v_fwd_s * R[..., 0]
+        + v_left_s.abs() * v_left_s * R[..., 1]
+        + v_up_s.abs() * v_up_s * R[..., 2] * z_drag_coef
+    )
+    drag = drag + drag_2[:, 1:] * (
+        v_fwd_s * R[..., 0]
+        + v_left_s * R[..., 1]
+        + v_up_s * R[..., 2] * z_drag_coef
+    )
+
+    a_next = act_next + dg - drag
+
+    # Verlet 积分 + g_decay（前向不变，反向缩放梯度）
+    p_next = g_decay(p, grad_decay ** ctl_dt) + v * ctl_dt + 0.5 * a * ctl_dt ** 2
+    v_next = g_decay(v, grad_decay ** ctl_dt) + (a + a_next) / 2 * ctl_dt
+
+    return act_next, p_next, v_next, a_next
+
+
+run = run_forward
 
 
 class Env:
@@ -292,7 +304,7 @@ class Env:
         self.dg = torch.randn((B, 3), device=device) * 0.2
 
         R = torch.zeros((B, 3, 3), device=device)
-        self.R = quadsim_cuda.update_state_vec(R, self.act, torch.randn((B, 3), device=device) * 0.2 + F.normalize(self.p_target - self.p),
+        self.R = Env.update_state_vec(R, self.act, torch.randn((B, 3), device=device) * 0.2 + F.normalize(self.p_target - self.p),
             torch.zeros_like(self.yaw_ctl_delay), 5)
         self.R_old = self.R.clone()
         self.p_old = self.p
@@ -306,68 +318,30 @@ class Env:
     @staticmethod
     @torch.no_grad()
     def update_state_vec(R, a_thr, v_pred, alpha, yaw_inertia=5):
-        """
-        更新无人机的旋转矩阵 (姿态)。
-        
-        参数:
-            R: 当前的旋转矩阵 (Batch, 3, 3)。[Forward, Left, Up]
-            a_thr: 当前的总加速度/推力向量 (Batch, 3)。包含重力抵消部分。
-            v_pred: 预测的目标速度方向 (Batch, 3)。用于引导机头朝向 (Yaw)。
-            alpha: 平滑系数 (0~1)。控制机头转向的平滑程度。
-            yaw_inertia: 偏航惯性系数。越大越难转向。
-        """
-        # 1. 获取当前的机头方向 (Forward Vector)
-        # R[..., 0] 对应旋转矩阵的第一列，即机体坐标系的 X 轴 (前方)
-        self_forward_vec = R[..., 0]
-        
-        # 2. 计算纯推力方向 (Up Vector)
-        # 四旋翼的推力方向永远垂直于机身平面向上。
-        # a_thr 是总加速度，我们需要减去重力加速度 g_std 才能得到纯空气动力推力。
-        # 但这里代码写的是 a_thr - g_std，注意 g_std 是 (0, 0, -9.8)。
-        # 所以这里实际上是 a_thr - (0,0,-9.8) = a_thr + (0,0,9.8)。
-        # 这计算的是合外力方向，或者说是为了维持该加速度所需的推力方向。
-        g_std = torch.tensor([0, 0, -9.80665], device=R.device)
-        a_thr = a_thr - g_std 
-        
-        # 归一化得到单位向量，这就是新的机身“上方” (Z轴)
-        thrust = torch.norm(a_thr, 2, -1, True)
-        self_up_vec = a_thr / thrust
+        GRAVITY = 9.80665
+        g_offset = torch.tensor([0.0, 0.0, GRAVITY], device=R.device, dtype=R.dtype)
+        a_thr_g = a_thr + g_offset
 
-        # 3. 计算新的机头方向 (Forward Vector / Yaw)
-        # 这是一个混合操作：
-        # 旧的机头方向 * 惯性 + 预测的速度方向
-        # 意图：让机头慢慢转向飞行的方向 (Coordinated Turn)。
-        forward_vec = self_forward_vec * yaw_inertia + v_pred
-        
-        # 使用 alpha 进行平滑插值 (低通滤波)
-        # 新方向 = 旧方向 * alpha + 目标方向 * (1-alpha)
-        forward_vec = self_forward_vec * alpha + F.normalize(forward_vec, 2, -1) * (1 - alpha)
-        
-        # 4. 施加几何约束 (Gram-Schmidt 正交化)
-        # 机头方向 (Forward) 必须与机身垂直方向 (Up) 正交。
-        # 也就是 Forward 向量必须在与 Up 向量垂直的平面上。
-        # 公式推导：我们要找一个 forward_vec，使得 dot(forward, up) = 0。
-        # 这里通过调整 forward_vec 的 Z 分量来实现正交化。
-        # (fx * ux + fy * uy + fz * uz = 0) => fz = -(fx * ux + fy * uy) / uz
-        forward_vec[:, 2] = (forward_vec[:, 0] * self_up_vec[:, 0] + forward_vec[:, 1] * self_up_vec[:, 1]) / -self_up_vec[2]
-        
-        # 归一化得到最终的机头方向
-        self_forward_vec = F.normalize(forward_vec, 2, -1)
-        
-        # 5. 计算左侧方向 (Left Vector)
-        # 利用叉乘：Left = Up x Forward (注意顺序，右手定则)
-        # 或者是 Cross(Up, Forward) 得到 Left? 
-        # 通常坐标系是：X(前), Y(左), Z(上)。
-        # Cross(Z, X) = Y。即 Cross(Up, Forward) = Left。
-        self_left_vec = torch.cross(self_up_vec, self_forward_vec)
-        
-        # 6. 组合成新的旋转矩阵
-        # 将三个正交基向量堆叠起来
-        return torch.stack([
-            self_forward_vec, # Col 0: X axis
-            self_left_vec,    # Col 1: Y axis
-            self_up_vec,      # Col 2: Z axis
-        ], -1)
+        raw_thrust = a_thr_g.norm(2, -1, keepdim=True)
+        default_up = torch.tensor([0.0, 0.0, 1.0], device=R.device, dtype=R.dtype).expand_as(a_thr_g)
+        up = torch.where(raw_thrust < 1e-8, default_up, a_thr_g / raw_thrust.clamp(min=1e-8))
+
+        fwd_old = R[..., 0]
+        fwd = fwd_old * yaw_inertia + v_pred
+        fwd = F.normalize(fwd, 2, -1)
+        fwd = (1 - alpha) * fwd + alpha * fwd_old
+
+        uz_safe = torch.where(
+            up[:, 2:3] >= 0,
+            up[:, 2:3].clamp(min=1e-6),
+            up[:, 2:3].clamp(max=-1e-6),
+        )
+        fwd_z = (fwd[:, 0:1] * up[:, 0:1] + fwd[:, 1:2] * up[:, 1:2]) / (-uz_safe)
+        fwd = torch.cat([fwd[:, 0:1], fwd[:, 1:2], fwd_z], dim=-1)
+        fwd = F.normalize(fwd, 2, -1)
+
+        left = torch.cross(up, fwd, dim=-1)
+        return torch.stack([fwd, left, up], dim=-1)
 
     def render(self, ctl_dt):
         canvas = torch.empty((self.batch_size, self.height, self.width), device=self.device)
@@ -424,11 +398,11 @@ class Env:
         self.act, self.p, self.v, self.a = run(
             self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
             act_pred, self.act, self.p, self.v, self.v_wind, self.a,
-            self.grad_decay, ctl_dt, 0.5)
+            self.grad_decay, ctl_dt)
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+        self.R = Env.update_state_vec(self.R, self.act, v_pred, alpha, 5)
 
     def _run(self, act_pred, ctl_dt=1/15, v_pred=None):
         alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
@@ -450,5 +424,5 @@ class Env:
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+        self.R = Env.update_state_vec(self.R, self.act, v_pred, alpha, 5)
 
