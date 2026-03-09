@@ -4,7 +4,7 @@ __pycache__
 .venv
 *.egg-info
 dist
-quadsim_cuda/src/**/*.so
+*.so
 runs/
 log/
 checkpoints/*.pth
